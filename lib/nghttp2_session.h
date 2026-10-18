@@ -198,6 +198,31 @@ struct nghttp2_inflight_settings {
 
 typedef struct nghttp2_inflight_settings nghttp2_inflight_settings;
 
+/* Anole patch: the fate of a peer stream that no longer has a stream
+   object. */
+typedef enum {
+  /* Not remembered: closed too long ago, or never seen. */
+  NGHTTP2_PEER_STREAM_FATE_UNKNOWN = 0,
+  /* The peer reset it with RST_STREAM. */
+  NGHTTP2_PEER_STREAM_FATE_PEER_RST = 1,
+  /* It closed normally after the peer sent END_STREAM. */
+  NGHTTP2_PEER_STREAM_FATE_PEER_END = 2,
+  /* This endpoint reset it: the peer may still have frames in flight. */
+  NGHTTP2_PEER_STREAM_FATE_LOCAL_RST = 3,
+  /* An ID below the highest one received that was never opened, and so
+     was closed implicitly (RFC 9113 section 5.1.1). */
+  NGHTTP2_PEER_STREAM_FATE_NEVER_OPENED = 4
+} nghttp2_peer_stream_fate;
+
+#define NGHTTP2_CLOSED_STREAM_LOG_LEN 256
+/* Peer stream IDs (one parity) covered by opened_bits; a power of 2. */
+#define NGHTTP2_OPENED_STREAM_WINDOW 2048
+
+typedef struct {
+  int32_t stream_id;
+  uint8_t fate;
+} nghttp2_closed_stream_record;
+
 struct nghttp2_session {
   nghttp2_map /* <nghttp2_stream*> */ streams;
   /* Queue for outbound urgent frames (PING and SETTINGS) */
@@ -288,6 +313,18 @@ struct nghttp2_session {
   int32_t last_sent_stream_id;
   /* The largest stream ID received so far */
   int32_t last_recv_stream_id;
+  /* Anole patch: what became of recently closed peer streams, so a
+     frame on one can be answered as RFC 9113 section 5.1 says (see
+     session_peer_stream_fate).  A ring of the last
+     NGHTTP2_CLOSED_STREAM_LOG_LEN closes, and a bitmap of which peer
+     stream IDs among the last 2 * NGHTTP2_OPENED_STREAM_WINDOW were
+     opened at all. */
+  nghttp2_closed_stream_record closed_log[NGHTTP2_CLOSED_STREAM_LOG_LEN];
+  size_t closed_log_next;
+  uint8_t opened_bits[NGHTTP2_OPENED_STREAM_WINDOW / 8];
+  /* Set around a nghttp2_session_close_stream call to say why the
+     stream closes; 0 lets nghttp2_session_close_stream work it out. */
+  uint8_t pending_close_fate;
   /* The largest stream ID which has been processed in some way. This
      value will be used as last-stream-id when sending GOAWAY
      frame. */

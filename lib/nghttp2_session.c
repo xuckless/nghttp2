@@ -148,6 +148,82 @@ static int session_detect_idle_stream(nghttp2_session *session,
   return 0;
 }
 
+/* Anole patch: strict handling of frames on closed peer streams.
+
+   nghttp2 keeps no state for closed streams, so it cannot tell a peer
+   that sends on a stream it reset or ended (a protocol error, RFC 9113
+   section 5.1) from a peer whose frames crossed this endpoint's
+   RST_STREAM (allowed), and it ignores both.  These remember enough to
+   tell them apart for recent streams; anything not remembered is still
+   ignored, as before. */
+
+static size_t session_opened_bit(int32_t stream_id) {
+  return ((uint32_t)stream_id >> 1) & (NGHTTP2_OPENED_STREAM_WINDOW - 1);
+}
+
+/* Records that the peer opened |stream_id|, which is above every peer
+   stream ID received so far: the IDs skipped in between were closed
+   without being opened. */
+static void session_mark_peer_stream_opened(nghttp2_session *session,
+                                            int32_t stream_id) {
+  int32_t last = session->last_recv_stream_id;
+  int32_t from = last == 0 ? (stream_id & 1) : last + 2;
+  int32_t id;
+  size_t bit;
+
+  if (stream_id < from ||
+      (stream_id - from) / 2 >= NGHTTP2_OPENED_STREAM_WINDOW) {
+    memset(session->opened_bits, 0, sizeof(session->opened_bits));
+  } else {
+    for (id = from; id < stream_id; id += 2) {
+      bit = session_opened_bit(id);
+      session->opened_bits[bit / 8] &= (uint8_t)~(1u << (bit % 8));
+    }
+  }
+  bit = session_opened_bit(stream_id);
+  session->opened_bits[bit / 8] |= (uint8_t)(1u << (bit % 8));
+}
+
+static void session_log_peer_stream_closed(nghttp2_session *session,
+                                           int32_t stream_id, uint8_t fate) {
+  nghttp2_closed_stream_record *rec;
+
+  if (nghttp2_session_is_my_stream_id(session, stream_id)) {
+    return;
+  }
+  rec = &session->closed_log[session->closed_log_next];
+  rec->stream_id = stream_id;
+  rec->fate = fate;
+  session->closed_log_next =
+    (session->closed_log_next + 1) % NGHTTP2_CLOSED_STREAM_LOG_LEN;
+}
+
+/* What became of peer stream |stream_id|, which has no stream object
+   and is not idle. */
+static nghttp2_peer_stream_fate
+session_peer_stream_fate(nghttp2_session *session, int32_t stream_id) {
+  size_t i;
+  size_t bit;
+
+  if (nghttp2_session_is_my_stream_id(session, stream_id)) {
+    return NGHTTP2_PEER_STREAM_FATE_UNKNOWN;
+  }
+  for (i = 0; i < NGHTTP2_CLOSED_STREAM_LOG_LEN; ++i) {
+    if (session->closed_log[i].stream_id == stream_id) {
+      return (nghttp2_peer_stream_fate)session->closed_log[i].fate;
+    }
+  }
+  if (stream_id < session->last_recv_stream_id &&
+      (session->last_recv_stream_id - stream_id) / 2 <
+        NGHTTP2_OPENED_STREAM_WINDOW) {
+    bit = session_opened_bit(stream_id);
+    if (!(session->opened_bits[bit / 8] & (1u << (bit % 8)))) {
+      return NGHTTP2_PEER_STREAM_FATE_NEVER_OPENED;
+    }
+  }
+  return NGHTTP2_PEER_STREAM_FATE_UNKNOWN;
+}
+
 static int check_ext_type_set(const uint8_t *ext_types, uint8_t type) {
   return (ext_types[type / 8] & (1 << (type & 0x7))) > 0;
 }
@@ -1298,6 +1374,15 @@ int nghttp2_session_close_stream(nghttp2_session *session, int32_t stream_id,
   }
 
   DEBUGF("stream: stream(%p)=%d close\n", stream, stream->stream_id);
+
+  /* Anole patch: remember how a peer stream closed. */
+  session_log_peer_stream_closed(
+    session, stream_id,
+    session->pending_close_fate
+      ? session->pending_close_fate
+      : ((stream->shut_flags & NGHTTP2_SHUT_RD)
+           ? (uint8_t)NGHTTP2_PEER_STREAM_FATE_PEER_END
+           : (uint8_t)NGHTTP2_PEER_STREAM_FATE_LOCAL_RST));
 
   /* We call on_stream_close_callback even if stream->state is
      NGHTTP2_STREAM_INITIAL. This will happen while sending request
@@ -2646,8 +2731,10 @@ static int session_after_frame_sent1(nghttp2_session *session) {
   case NGHTTP2_PRIORITY:
     return 0;
   case NGHTTP2_RST_STREAM:
+    session->pending_close_fate = NGHTTP2_PEER_STREAM_FATE_LOCAL_RST;
     rv = nghttp2_session_close_stream(session, frame->hd.stream_id,
                                       frame->rst_stream.error_code);
+    session->pending_close_fate = 0;
     if (nghttp2_is_fatal(rv)) {
       return rv;
     }
@@ -3884,8 +3971,28 @@ int nghttp2_session_on_request_headers_received(nghttp2_session *session,
         session, frame, NGHTTP2_ERR_STREAM_CLOSED, "HEADERS: stream closed");
     }
 
+    /* Anole patch: answer what is known to be the peer's mistake. */
+    if (!stream) {
+      switch (session_peer_stream_fate(session, frame->hd.stream_id)) {
+      case NGHTTP2_PEER_STREAM_FATE_NEVER_OPENED:
+        return session_inflate_handle_invalid_connection(
+          session, frame, NGHTTP2_ERR_PROTO,
+          "request HEADERS: stream_id smaller than a previous one");
+      case NGHTTP2_PEER_STREAM_FATE_PEER_RST:
+        return session_inflate_handle_invalid_stream(
+          session, frame, NGHTTP2_ERR_STREAM_CLOSED);
+      case NGHTTP2_PEER_STREAM_FATE_PEER_END:
+        return session_inflate_handle_invalid_connection(
+          session, frame, NGHTTP2_ERR_STREAM_CLOSED,
+          "HEADERS: stream closed after END_STREAM");
+      default:
+        break;
+      }
+    }
+
     return NGHTTP2_ERR_IGN_HEADER_BLOCK;
   }
+  session_mark_peer_stream_opened(session, frame->hd.stream_id);
   session->last_recv_stream_id = frame->hd.stream_id;
 
   if (session_is_incoming_concurrent_streams_max(session)) {
@@ -4117,8 +4224,10 @@ int nghttp2_session_on_rst_stream_received(nghttp2_session *session,
   if (rv != 0) {
     return rv;
   }
+  session->pending_close_fate = NGHTTP2_PEER_STREAM_FATE_PEER_RST;
   rv = nghttp2_session_close_stream(session, frame->hd.stream_id,
                                     frame->rst_stream.error_code);
+  session->pending_close_fate = 0;
   if (nghttp2_is_fatal(rv)) {
     return rv;
   }
@@ -4778,9 +4887,10 @@ static int session_on_stream_window_update_received(nghttp2_session *session,
   }
   if (NGHTTP2_MAX_WINDOW_SIZE - frame->window_update.window_size_increment <
       stream->remote_window_size) {
-    return session_handle_invalid_connection(
-      session, frame, NGHTTP2_ERR_FLOW_CONTROL,
-      "WINDOW_UPDATE: window size overflow");
+    /* Anole patch: a stream window overflow ends the stream, not the
+       connection (RFC 9113 section 6.9.1). */
+    return session_handle_invalid_stream(session, frame,
+                                         NGHTTP2_ERR_FLOW_CONTROL);
   }
   stream->remote_window_size += frame->window_update.window_size_increment;
 
@@ -5241,6 +5351,26 @@ static int session_on_data_received_fail_fast(nghttp2_session *session) {
       failure_reason = "DATA: stream closed";
       error_code = NGHTTP2_STREAM_CLOSED;
       goto fail;
+    }
+
+    /* Anole patch: answer what is known to be the peer's mistake. */
+    if (!stream) {
+      switch (session_peer_stream_fate(session, stream_id)) {
+      case NGHTTP2_PEER_STREAM_FATE_PEER_RST:
+        rv = nghttp2_session_add_rst_stream(session, stream_id,
+                                            NGHTTP2_STREAM_CLOSED);
+        if (nghttp2_is_fatal(rv)) {
+          return rv;
+        }
+        return NGHTTP2_ERR_IGN_PAYLOAD;
+      case NGHTTP2_PEER_STREAM_FATE_PEER_END:
+      case NGHTTP2_PEER_STREAM_FATE_NEVER_OPENED:
+        failure_reason = "DATA: stream closed";
+        error_code = NGHTTP2_STREAM_CLOSED;
+        goto fail;
+      default:
+        break;
+      }
     }
 
     return NGHTTP2_ERR_IGN_PAYLOAD;
@@ -6215,10 +6345,41 @@ nghttp2_ssize nghttp2_session_mem_recv2(nghttp2_session *session,
         iframe->state = NGHTTP2_IB_READ_HEADER_BLOCK;
 
         break;
-      case NGHTTP2_PRIORITY:
+      case NGHTTP2_PRIORITY: {
+        /* Anole patch: RFC 7540 priorities stay ignored, but the frame
+           is still checked as RFC 9113 section 6.3 requires. */
+        nghttp2_priority_spec pri_spec;
+
+        if (iframe->frame.hd.stream_id == 0) {
+          rv = nghttp2_session_terminate_session_with_reason(
+            session, NGHTTP2_PROTOCOL_ERROR, "PRIORITY: stream_id == 0");
+          if (nghttp2_is_fatal(rv)) {
+            return rv;
+          }
+          session_inbound_frame_reset(session);
+          break;
+        }
+        nghttp2_frame_unpack_priority_spec(&pri_spec, iframe->sbuf.pos);
+        if (pri_spec.stream_id == iframe->frame.hd.stream_id) {
+          /* A stream error, except that RST_STREAM must not be sent on
+             an idle stream, which leaves a connection error. */
+          if (session_detect_idle_stream(session,
+                                         iframe->frame.hd.stream_id)) {
+            rv = nghttp2_session_terminate_session_with_reason(
+              session, NGHTTP2_PROTOCOL_ERROR,
+              "PRIORITY: stream depends on itself");
+          } else {
+            rv = nghttp2_session_add_rst_stream(
+              session, iframe->frame.hd.stream_id, NGHTTP2_PROTOCOL_ERROR);
+          }
+          if (nghttp2_is_fatal(rv)) {
+            return rv;
+          }
+        }
         session_inbound_frame_reset(session);
 
         break;
+      }
       case NGHTTP2_RST_STREAM:
         rv = session_process_rst_stream_frame(session);
         if (nghttp2_is_fatal(rv)) {

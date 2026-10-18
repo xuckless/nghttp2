@@ -152,6 +152,7 @@ static const MunitTest tests[] = {
   munit_void_test(test_nghttp2_session_cancel_from_before_frame_send),
   munit_void_test(test_nghttp2_session_too_many_settings),
   munit_void_test(test_nghttp2_session_removed_closed_stream),
+  munit_void_test(test_nghttp2_session_anole_strict_frames),
   munit_void_test(test_nghttp2_session_pause_data),
   munit_void_test(test_nghttp2_session_no_closed_streams),
   munit_void_test(test_nghttp2_session_set_stream_user_data),
@@ -4876,7 +4877,9 @@ void test_nghttp2_session_on_data_received_fail_fast(void) {
 
   nghttp2_session_server_new(&session, &callbacks, NULL);
 
-  /* DATA to closed stream with explicit closed (remote) */
+  /* DATA to closed stream with explicit closed (remote).  Anole
+     patch: the peer had ended the stream, so this is a connection
+     error of type STREAM_CLOSED (RFC 9113 section 5.1). */
   stream = open_recv_stream(session, 1);
   nghttp2_stream_shutdown(stream, NGHTTP2_SHUT_RD);
   nghttp2_session_close_stream(session, 1, NGHTTP2_NO_ERROR);
@@ -4886,7 +4889,45 @@ void test_nghttp2_session_on_data_received_fail_fast(void) {
 
   item = nghttp2_session_get_next_ob_item(session);
 
-  assert_null(item);
+  assert_not_null(item);
+  assert_uint8(NGHTTP2_GOAWAY, ==, item->frame.hd.type);
+  assert_uint32(NGHTTP2_STREAM_CLOSED, ==, item->frame.goaway.error_code);
+
+  nghttp2_session_del(session);
+
+  nghttp2_session_server_new(&session, &callbacks, NULL);
+
+  /* Anole patch: DATA to a stream this endpoint reset may have crossed
+     the RST_STREAM, so it is still ignored. */
+  stream = open_recv_stream(session, 1);
+  session->pending_close_fate = NGHTTP2_PEER_STREAM_FATE_LOCAL_RST;
+  nghttp2_session_close_stream(session, 1, NGHTTP2_CANCEL);
+  session->pending_close_fate = 0;
+
+  assert_ptrdiff((nghttp2_ssize)sizeof(buf), ==,
+                 nghttp2_session_mem_recv2(session, buf, sizeof(buf)));
+
+  assert_null(nghttp2_session_get_next_ob_item(session));
+
+  nghttp2_session_del(session);
+
+  nghttp2_session_server_new(&session, &callbacks, NULL);
+
+  /* Anole patch: DATA after the peer's RST_STREAM is a stream error of
+     type STREAM_CLOSED. */
+  open_recv_stream(session, 1);
+  session->pending_close_fate = NGHTTP2_PEER_STREAM_FATE_PEER_RST;
+  nghttp2_session_close_stream(session, 1, NGHTTP2_CANCEL);
+  session->pending_close_fate = 0;
+
+  assert_ptrdiff((nghttp2_ssize)sizeof(buf), ==,
+                 nghttp2_session_mem_recv2(session, buf, sizeof(buf)));
+
+  item = nghttp2_session_get_next_ob_item(session);
+
+  assert_not_null(item);
+  assert_uint8(NGHTTP2_RST_STREAM, ==, item->frame.hd.type);
+  assert_uint32(NGHTTP2_STREAM_CLOSED, ==, item->frame.rst_stream.error_code);
 
   nghttp2_session_del(session);
 }
@@ -9868,7 +9909,11 @@ prepare_session_removed_closed_stream(nghttp2_session *session,
     nghttp2_bufs_reset(&bufs);
   }
 
+  /* Anole patch: closed as by this endpoint's RST_STREAM, so frames
+     the peer sends on it afterwards are ignored rather than errors. */
+  session->pending_close_fate = NGHTTP2_PEER_STREAM_FATE_LOCAL_RST;
   nghttp2_session_close_stream(session, 3, NGHTTP2_NO_ERROR);
+  session->pending_close_fate = 0;
 
   rv = pack_headers(&bufs, deflater, 5,
                     NGHTTP2_FLAG_END_HEADERS | NGHTTP2_FLAG_END_STREAM, reqnv,
@@ -12254,4 +12299,111 @@ void test_nghttp2_http_no_rfc9113_leading_and_trailing_ws_validation(void) {
   nghttp2_option_del(option);
 
   nghttp2_bufs_free(&bufs);
+}
+
+/* Anole patch: frames RFC 9113 calls errors that stock nghttp2 ignores. */
+void test_nghttp2_session_anole_strict_frames(void) {
+  nghttp2_session *session;
+  nghttp2_session_callbacks callbacks;
+  nghttp2_outbound_item *item;
+  nghttp2_hd_deflater deflater;
+  nghttp2_bufs bufs;
+  nghttp2_mem *mem;
+  nghttp2_frame_hd hd;
+  uint8_t buf[NGHTTP2_FRAME_HDLEN + 5];
+  nghttp2_ssize nread;
+  int rv;
+
+  mem = nghttp2_mem_default();
+  memset(&callbacks, 0, sizeof(callbacks));
+
+  /* PRIORITY on stream 0: connection error PROTOCOL_ERROR (6.3). */
+  nghttp2_session_server_new(&session, &callbacks, NULL);
+  nghttp2_frame_hd_init(&hd, 5, NGHTTP2_PRIORITY, NGHTTP2_FLAG_NONE, 0);
+  nghttp2_frame_pack_frame_hd(buf, &hd);
+  memset(buf + NGHTTP2_FRAME_HDLEN, 0, 5);
+  buf[NGHTTP2_FRAME_HDLEN + 3] = 1;
+  nread = nghttp2_session_mem_recv2(session, buf, sizeof(buf));
+  assert_ptrdiff((nghttp2_ssize)sizeof(buf), ==, nread);
+  item = nghttp2_session_get_next_ob_item(session);
+  assert_not_null(item);
+  assert_uint8(NGHTTP2_GOAWAY, ==, item->frame.hd.type);
+  assert_uint32(NGHTTP2_PROTOCOL_ERROR, ==, item->frame.goaway.error_code);
+  nghttp2_session_del(session);
+
+  /* PRIORITY on an idle stream that depends on itself: RST_STREAM
+     must not be sent on an idle stream, so a connection error. */
+  nghttp2_session_server_new(&session, &callbacks, NULL);
+  nghttp2_frame_hd_init(&hd, 5, NGHTTP2_PRIORITY, NGHTTP2_FLAG_NONE, 3);
+  nghttp2_frame_pack_frame_hd(buf, &hd);
+  memset(buf + NGHTTP2_FRAME_HDLEN, 0, 5);
+  buf[NGHTTP2_FRAME_HDLEN + 3] = 3;
+  nread = nghttp2_session_mem_recv2(session, buf, sizeof(buf));
+  assert_ptrdiff((nghttp2_ssize)sizeof(buf), ==, nread);
+  item = nghttp2_session_get_next_ob_item(session);
+  assert_not_null(item);
+  assert_uint8(NGHTTP2_GOAWAY, ==, item->frame.hd.type);
+  assert_uint32(NGHTTP2_PROTOCOL_ERROR, ==, item->frame.goaway.error_code);
+  nghttp2_session_del(session);
+
+  /* The same on an open stream: stream error PROTOCOL_ERROR (5.3.1). */
+  nghttp2_session_server_new(&session, &callbacks, NULL);
+  open_recv_stream(session, 3);
+  nghttp2_frame_hd_init(&hd, 5, NGHTTP2_PRIORITY, NGHTTP2_FLAG_NONE, 3);
+  nghttp2_frame_pack_frame_hd(buf, &hd);
+  memset(buf + NGHTTP2_FRAME_HDLEN, 0, 5);
+  buf[NGHTTP2_FRAME_HDLEN + 3] = 3;
+  nread = nghttp2_session_mem_recv2(session, buf, sizeof(buf));
+  assert_ptrdiff((nghttp2_ssize)sizeof(buf), ==, nread);
+  item = nghttp2_session_get_next_ob_item(session);
+  assert_not_null(item);
+  assert_uint8(NGHTTP2_RST_STREAM, ==, item->frame.hd.type);
+  assert_int32(3, ==, item->frame.hd.stream_id);
+  assert_uint32(NGHTTP2_PROTOCOL_ERROR, ==, item->frame.rst_stream.error_code);
+  nghttp2_session_del(session);
+
+  /* WINDOW_UPDATE taking a stream window past 2^31-1: stream error
+     FLOW_CONTROL_ERROR (6.9.1), not a connection error. */
+  nghttp2_session_server_new(&session, &callbacks, NULL);
+  open_recv_stream(session, 1);
+  nghttp2_frame_hd_init(&hd, 4, NGHTTP2_WINDOW_UPDATE, NGHTTP2_FLAG_NONE, 1);
+  nghttp2_frame_pack_frame_hd(buf, &hd);
+  nghttp2_put_uint32be(buf + NGHTTP2_FRAME_HDLEN, NGHTTP2_MAX_WINDOW_SIZE);
+  nread = nghttp2_session_mem_recv2(session, buf, NGHTTP2_FRAME_HDLEN + 4);
+  assert_ptrdiff(NGHTTP2_FRAME_HDLEN + 4, ==, nread);
+  item = nghttp2_session_get_next_ob_item(session);
+  assert_not_null(item);
+  assert_uint8(NGHTTP2_RST_STREAM, ==, item->frame.hd.type);
+  assert_uint32(NGHTTP2_FLOW_CONTROL_ERROR, ==,
+                item->frame.rst_stream.error_code);
+  nghttp2_session_del(session);
+
+  /* A request on a lower stream ID than one already opened, which was
+     never opened itself: connection error PROTOCOL_ERROR (5.1.1). */
+  nghttp2_session_server_new(&session, &callbacks, NULL);
+  nghttp2_hd_deflate_init(&deflater, mem);
+  frame_pack_bufs_init(&bufs);
+  rv = pack_headers(&bufs, &deflater, 5,
+                    NGHTTP2_FLAG_END_HEADERS | NGHTTP2_FLAG_END_STREAM, reqnv,
+                    ARRLEN(reqnv), mem);
+  assert_int(0, ==, rv);
+  nread = nghttp2_session_mem_recv2(session, bufs.head->buf.pos,
+                                    nghttp2_bufs_len(&bufs));
+  assert_ptrdiff((nghttp2_ssize)nghttp2_bufs_len(&bufs), ==, nread);
+  assert_null(nghttp2_session_get_next_ob_item(session));
+  nghttp2_bufs_reset(&bufs);
+  rv = pack_headers(&bufs, &deflater, 3,
+                    NGHTTP2_FLAG_END_HEADERS | NGHTTP2_FLAG_END_STREAM, reqnv,
+                    ARRLEN(reqnv), mem);
+  assert_int(0, ==, rv);
+  nread = nghttp2_session_mem_recv2(session, bufs.head->buf.pos,
+                                    nghttp2_bufs_len(&bufs));
+  assert_ptrdiff((nghttp2_ssize)nghttp2_bufs_len(&bufs), ==, nread);
+  item = nghttp2_session_get_next_ob_item(session);
+  assert_not_null(item);
+  assert_uint8(NGHTTP2_GOAWAY, ==, item->frame.hd.type);
+  assert_uint32(NGHTTP2_PROTOCOL_ERROR, ==, item->frame.goaway.error_code);
+  nghttp2_bufs_free(&bufs);
+  nghttp2_hd_deflate_free(&deflater);
+  nghttp2_session_del(session);
 }
